@@ -11,6 +11,7 @@ from audio_module import AudioProcessor
 from text_similarity import TextSimilarity
 from text_context import TextContext
 from llm_module import LLM
+from transcribe import DEFAULT_RECORDER_CONFIG
 from colors import Colors
 
 # (Logging setup)
@@ -18,7 +19,8 @@ logger = logging.getLogger(__name__)
 
 # (Load system prompt)
 try:
-    with open("system_prompt.txt", "r", encoding="utf-8") as f:
+    from pathlib import Path
+    with open(Path(__file__).resolve().parent / "system_prompt.txt", "r", encoding="utf-8") as f:
         system_prompt = f.read().strip()
     logger.info("🗣️📄 System prompt loaded from file.")
 except FileNotFoundError:
@@ -42,6 +44,13 @@ Do NOT create or use any other emotion tags. Do NOT remove the spaces. Use these
 """.strip()
 
 orpheus_prompt_addon = orpheus_prompt_addon_uncensored if USE_ORPHEUS_UNCENSORED else orpheus_prompt_addon_normal
+
+# --- Abort hysteresis (prevents abort thrash on evolving partials) ---
+# Refinements of in-flight text (similarity at/above this) never abort:
+# only genuine topic changes do. Async (partial-driven) aborts are also
+# debounced so a burst of partials can't restart generations repeatedly.
+ABORT_IGNORE_SIMILARITY = 0.6
+ABORT_DEBOUNCE_S = 1.5
 
 
 class PipelineRequest:
@@ -122,8 +131,8 @@ class SpeechPipelineManager:
     def __init__(
             self,
             tts_engine: str = "kokoro",
-            llm_provider: str = "ollama",
-            llm_model: str = "hf.co/bartowski/huihui-ai_Mistral-Small-24B-Instruct-2501-abliterated-GGUF:Q4_K_M",
+            llm_provider: str = "llamacpp",
+            llm_model: str = "gemma-4-12B-it-qat-UD-Q4_K_XL",
             no_think: bool = False,
             orpheus_model: str = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf",
         ):
@@ -150,6 +159,18 @@ class SpeechPipelineManager:
         self.system_prompt = system_prompt
         if tts_engine == "orpheus":
             self.system_prompt += f"\n{orpheus_prompt_addon}"
+
+        # Runtime configuration disclosure: the assistant should know which
+        # components serve this conversation. Names only — never secrets/keys.
+        stt_model = DEFAULT_RECORDER_CONFIG.get("model", "unknown")
+        stt_lang = DEFAULT_RECORDER_CONFIG.get("language", "en")
+        self.system_prompt += (
+            "\n\nRuntime configuration (the actual components serving this "
+            "conversation — describe accurately if asked):"
+            f"\n- Language model: {llm_model} via {llm_provider}"
+            f"\n- Speech synthesis (your voice): {tts_engine} engine"
+            f"\n- Speech recognition (your ears): {stt_model} (faster-whisper), {stt_lang}"
+        )
 
         # --- Instance Dependencies ---
         self.audio = AudioProcessor(
@@ -191,6 +212,7 @@ class SpeechPipelineManager:
         self.abort_block_event = threading.Event()
         self.abort_block_event.set()
         self.check_abort_lock = threading.Lock()
+        self._last_abort_time = 0.0 # For ABORT_DEBOUNCE_S on the async path
 
         # --- State Flags ---
         self.llm_generation_active = False
@@ -445,10 +467,13 @@ class SpeechPipelineManager:
 
         Compares the provided text (`txt`) with the text of the `running_generation`.
         If a generation is running and not already aborting:
-        1. If `txt` is very similar (>= 0.95 similarity) to the running generation's
-           input text, it ignores the new request and returns False.
-        2. If `txt` is different, it initiates an abort of the current generation
-           by calling the public `abort_generation` method.
+        1. If `txt` is similar (>= ABORT_IGNORE_SIMILARITY) to the running
+           generation's input text, it ignores the new request and returns
+           False (evolving partials must not kill in-flight answers).
+        2. If `txt` is genuinely divergent, it initiates an abort. Async
+           (non-waiting) callers are additionally debounced so partial bursts
+           can't restart generations in a loop; synchronous prepares always
+           get a clean slate.
 
         If `wait_for_finish` is True, this method waits for the abortion process
         initiated by `abort_generation` to complete before returning.
@@ -507,9 +532,20 @@ class SpeechPipelineManager:
                         logger.warning(f"🗣️🛑💥 {current_gen_id_str} Error calculating similarity: {e}. Assuming different.")
                         similarity = 0.0 # Assume different on error
 
-                    if similarity >= 0.95:
-                        logger.info(f"🗣️🛑🙅 {current_gen_id_str} Text ('{txt[:30]}...') too similar ({similarity:.2f}) to current '{self.running_generation.text[:30] if self.running_generation.text else 'None'}...'. Ignoring.")
+                    if similarity >= ABORT_IGNORE_SIMILARITY:
+                        logger.info(f"🗣️🛑🙅 {current_gen_id_str} Text ('{txt[:30]}...') similar enough ({similarity:.2f}) to current '{self.running_generation.text[:30] if self.running_generation.text else 'None'}...'. Ignoring (refinement, not redirection).")
                         return False # No abort needed
+
+                    # Genuine divergence — but debounce rapid-fire async aborts
+                    # so one burst of partials can't restart generations in a loop.
+                    # (Synchronous prepares are never debounced: a truly new turn
+                    # always gets a clean slate.)
+                    if not wait_for_finish:
+                        now = time.time()
+                        if now - self._last_abort_time < ABORT_DEBOUNCE_S:
+                            logger.info(f"🗣️🛑⏭️ {current_gen_id_str} Divergent text ({similarity:.2f}) but debounced ({now - self._last_abort_time:.2f}s < {ABORT_DEBOUNCE_S}s since last abort). Ignoring.")
+                            return False
+                        self._last_abort_time = now
 
                     # Texts are different enough, initiate abort
                     logger.info(f"🗣️🛑🚀 {current_gen_id_str} Text ('{txt[:30]}...') different enough ({similarity:.2f}) from '{self.running_generation.text[:30] if self.running_generation.text else 'None'}...'. Requesting synchronous abort.")
@@ -789,6 +825,19 @@ class SpeechPipelineManager:
         """
         # --- Abort existing generation if necessary ---
         id_in_spec = self.generation_counter + 1 # Prospective ID for logging
+        # Fast path: refinement of the in-flight text is not a new turn.
+        # Skip the whole prepare (no abort, no replacement generation) so
+        # evolving partials can't churn Gen N -> N+1 -> N+2.
+        if self.is_valid_gen() and self.running_generation.text:
+            try:
+                sim = self.text_similarity.calculate_similarity(
+                    self.running_generation.text, txt)
+            except Exception:
+                sim = 0.0
+            if sim >= ABORT_IGNORE_SIMILARITY:
+                logger.info(f"🗣️⏭️ [Gen {id_in_spec}] Ignoring prepare, refinement "
+                            f"({sim:.2f}) of in-flight '[Gen {self.running_generation.id}]'.")
+                return
         aborted = self.check_abort(txt, wait_for_finish=True, abort_reason=f"process_prepare_generation for new id {id_in_spec}")
 
         # --- State is now guaranteed to be clean (running_generation is None) ---

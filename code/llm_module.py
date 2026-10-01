@@ -61,6 +61,7 @@ except ImportError:
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
+LLAMA_BASE_URL = os.getenv("LLAMA_BASE_URL", "http://127.0.0.1:8081/v1")
 
 # --- Backend Client Creation/Check Functions ---
 def _create_openai_client(api_key: Optional[str], base_url: Optional[str] = None) -> OpenAI:
@@ -186,11 +187,12 @@ class LLM:
     """
     Provides a unified interface for interacting with various LLM backends.
 
-    Supports Ollama (via direct HTTP), OpenAI API, and LMStudio (via OpenAI-compatible API).
+    Supports Ollama (via direct HTTP), OpenAI API, LMStudio (via OpenAI-compatible API),
+    and llama.cpp llama-server (via OpenAI-compatible API at /v1/chat/completions).
     Handles client initialization, streaming generation, request cancellation,
     system prompts, and basic connection management including an optional `ollama ps` check.
     """
-    SUPPORTED_BACKENDS = ["ollama", "openai", "lmstudio"]
+    SUPPORTED_BACKENDS = ["ollama", "openai", "lmstudio", "llamacpp"]
 
     def __init__(
         self,
@@ -223,8 +225,8 @@ class LLM:
 
         if self.backend == "ollama" and not REQUESTS_AVAILABLE:
              raise ImportError("requests library is required for the 'ollama' backend but not installed.")
-        if self.backend in ["openai", "lmstudio"] and not OPENAI_AVAILABLE:
-             raise ImportError("openai library is required for the 'openai'/'lmstudio' backends but not installed.")
+        if self.backend in ["openai", "lmstudio", "llamacpp"] and not OPENAI_AVAILABLE:
+             raise ImportError("openai library is required for the 'openai'/'lmstudio'/'llamacpp' backends but not installed.")
 
         self.model = model
         self.system_prompt = system_prompt
@@ -246,6 +248,13 @@ class LLM:
         self.effective_ollama_url = self._base_url or OLLAMA_BASE_URL if self.backend == "ollama" else None
         self.effective_lmstudio_url = self._base_url or LMSTUDIO_BASE_URL if self.backend == "lmstudio" else None
         self.effective_openai_base_url = self._base_url if self.backend == "openai" and self._base_url else None
+        self.effective_llama_url = self._base_url or LLAMA_BASE_URL if self.backend == "llamacpp" else None
+        if self.backend == "llamacpp" and self.effective_llama_url:
+            url = self.effective_llama_url.rstrip("/")
+            if not url.endswith("/v1"):
+                url = f"{url}/v1"
+            self.effective_llama_url = url
+            logger.debug(f"🤖⚙️ Normalized llama-server URL: {self.effective_llama_url}")
 
         if self.backend == "ollama" and self.effective_ollama_url:
              url = self.effective_ollama_url
@@ -277,13 +286,13 @@ class LLM:
             False otherwise.
         """
         if self._client_initialized:
-            if self.backend in ["openai", "lmstudio"]: return self.client is not None
+            if self.backend in ["openai", "lmstudio", "llamacpp"]: return self.client is not None
             if self.backend == "ollama": return self.ollama_session is not None and self._ollama_connection_ok # Check flag
             return False
 
         with self._client_init_lock:
             if self._client_initialized: # Double check
-                if self.backend in ["openai", "lmstudio"]: return self.client is not None
+                if self.backend in ["openai", "lmstudio", "llamacpp"]: return self.client is not None
                 if self.backend == "ollama": return self.ollama_session is not None and self._ollama_connection_ok
                 return False
 
@@ -297,6 +306,9 @@ class LLM:
                     init_ok = self.client is not None
                 elif self.backend == "lmstudio":
                     self.client = _create_openai_client(api_key="lmstudio-key", base_url=self.effective_lmstudio_url)
+                    init_ok = self.client is not None
+                elif self.backend == "llamacpp":
+                    self.client = _create_openai_client(api_key="no-key-needed", base_url=self.effective_llama_url)
                     init_ok = self.client is not None
                 elif self.backend == "ollama":
                     if self.ollama_session and self.effective_ollama_url:
@@ -680,6 +692,26 @@ class LLM:
                 )
                 stream_object_to_register = stream_iterator # The Stream object itself
                 self._register_request(req_id, "lmstudio", stream_object_to_register)
+                yield from self._yield_openai_chunks(stream_iterator, req_id)
+
+            elif self.backend == "llamacpp":
+                if self.client is None:
+                    raise RuntimeError("llama-server client not initialized (should have been caught by lazy_init).")
+                if 'temperature' not in kwargs:
+                    kwargs['temperature'] = 0.7
+                if 'stop' not in kwargs:
+                    # llama-server does not apply the GGUF template's stop
+                    # strings by default; without this the model leaks
+                    # '<|im_end|>' into content and can ramble past turn end.
+                    kwargs['stop'] = ["<|im_end|>"]
+                payload = { "model": self.model, "messages": messages, "stream": True, **kwargs }
+                logger.info(f"🤖💬 [{req_id}] Sending llama-server request with payload:")
+                logger.info(f"{json.dumps(payload, indent=2)}")
+                stream_iterator = self.client.chat.completions.create(
+                    model=self.model, messages=messages, stream=True, **kwargs
+                )
+                stream_object_to_register = stream_iterator # The Stream object itself
+                self._register_request(req_id, "llamacpp", stream_object_to_register)
                 yield from self._yield_openai_chunks(stream_iterator, req_id)
 
             elif self.backend == "ollama":

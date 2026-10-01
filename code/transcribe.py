@@ -25,11 +25,11 @@ START_STT_SERVER = False # Set to True to use the client/server version of Realt
 DEFAULT_RECORDER_CONFIG: Dict[str, Any] = {
     "use_microphone": False,
     "spinner": False,
-    "model": "base.en",
-    "realtime_model_type": "base.en",
+    "model": "large-v3-turbo",
+    "realtime_model_type": "large-v3-turbo",
     "use_main_model_for_realtime": False,
     "language": "en", # Default, will be overridden by source_language in __init__
-    "silero_sensitivity": 0.05,
+    "silero_sensitivity": 0.1,
     "webrtc_sensitivity": 3,
     "post_speech_silence_duration": 0.7,
     "min_length_of_recording": 0.5,
@@ -48,7 +48,7 @@ DEFAULT_RECORDER_CONFIG: Dict[str, Any] = {
     # Callbacks will be added dynamically in _create_recorder
     "debug_mode": True,
     "initial_prompt_realtime": "The sky is blue. When the sky... She walked home. Because he... Today is sunny. If only I...",
-    "faster_whisper_vad_filter": False,
+    "faster_whisper_vad_filter": True,
 }
 
 
@@ -63,6 +63,34 @@ if USE_TURN_DETECTION:
 
 INT16_MAX_ABS_VALUE: float = 32768.0
 SAMPLE_RATE: int = 16000
+
+# Well-known Whisper hallucinations emitted for silence/noise. Compared
+# normalized (lowercase, punctuation stripped); only exact matches on short
+# segments are dropped. Deliberately tight: a genuine lone "thanks", "bye",
+# or "yeah" must survive, so those are NOT listed. A lone "thank you" IS
+# dropped — accepted tradeoff (a real one is vanishingly rare as a full turn,
+# and the reported failure mode is silence -> "thank you").
+HALLUCINATION_DENYLIST = frozenset({
+    "thank you",
+    "thank you for watching",
+    "thanks for watching",
+    "thank you for your watching",
+    "transcript",
+    "subtitles",
+    "oh", "ah", "uh", "um", "mhm", "mm", "hmm",
+})
+HALLUCINATION_MAX_WORDS = 5
+
+
+def is_hallucination(text: Optional[str]) -> bool:
+    """True if text looks like a silence-induced Whisper hallucination."""
+    if not text:
+        return False
+    normalized = re.sub(r"[^a-z0-9\s]", "", text.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized or len(normalized.split()) > HALLUCINATION_MAX_WORDS:
+        return False
+    return normalized in HALLUCINATION_DENYLIST
 
 
 class TranscriptionProcessor:
@@ -153,6 +181,12 @@ class TranscriptionProcessor:
         self.silence_time: float = 0.0
         self.silence_active: bool = False
         self.last_audio_copy: Optional[np.ndarray] = None
+        # Per-frame echo marking from the client (isTTSPlaying flag). The mic
+        # hears the assistant's own speaker output on loud routes; recording
+        # the flag here lets barge-in logic distinguish echo from real speech.
+        # Audit/foundation only: audio flow is never modified.
+        self.last_mic_tts_playing: Optional[bool] = None
+        self.last_mic_flag_time: float = 0.0
 
         self.on_tts_allowed_to_synthesize: Optional[Callable] = None # Note: Seems unused
 
@@ -350,6 +384,10 @@ class TranscriptionProcessor:
         def on_final(text: Optional[str]):
             if text is None or text == "":
                 logger.warning("👂❓ Final transcription received None or empty string.")
+                return
+
+            if is_hallucination(text):
+                logger.info(f"👂🚫 Filtered suspected hallucination as final: {text!r}")
                 return
 
             self.final_transcription = text
@@ -707,6 +745,9 @@ class TranscriptionProcessor:
             if text is None:
                 # logger.warning(f"👂❓ {Colors.RED}Partial text received None{Colors.RESET}") # Can be noisy
                 return
+            if is_hallucination(text):
+                logger.debug(f"👂🚫 Filtered suspected hallucination as partial: {text!r}")
+                return
             self.realtime_text = text # Update the latest realtime text
 
             # Detect potential sentence ends based on punctuation stability
@@ -789,6 +830,14 @@ class TranscriptionProcessor:
         """
         if self.recorder and not self.shutdown_performed:
             try:
+                # Record the client's per-frame echo marking (if provided) for
+                # barge-in audit. Never gates or alters the audio flow.
+                if audio_meta_data is not None:
+                    try:
+                        self.last_mic_tts_playing = bool(audio_meta_data.get("isTTSPlaying", False))
+                        self.last_mic_flag_time = time.time()
+                    except Exception:
+                        pass
                 # Check if feed_audio expects metadata and provide if available
                 if START_STT_SERVER:
                      # Client might require metadata in a specific format

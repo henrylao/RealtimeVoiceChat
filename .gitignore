@@ -1,0 +1,14 @@
+# local-only runtime artefacts
+data/
+logs/
+.venv/
+__pycache__/
+*.pyc
+.env
+# vendored / large binaries - never commit logged data
+.libs/
+*.npy
+*.wav
+*.mp3
+speaker_id/registry/embeddings/
+speaker_id/__pycache__/
